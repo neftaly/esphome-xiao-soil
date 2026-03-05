@@ -1,0 +1,344 @@
+substitutions:
+  # Battery voltage range (NiMH: 1.0-1.4V, Alkaline: 1.2-1.5V)
+  battery_full: "1.4"
+  battery_empty: "1.0"
+
+esphome:
+  name: xiao-soil
+  friendly_name: "XIAO Soil Moisture"
+  name_add_mac_suffix: true
+  on_boot:
+    then:
+      # RF antenna: enable switch, select external (soil sensor PCB antenna)
+      - output.turn_off: rf_switch_en
+      - output.turn_on: rf_ant_select
+      - if:
+          condition:
+            lambda: 'return !id(is_calibrated);'
+          then:
+            - deep_sleep.prevent: deep_sleep_control
+      - script.execute: read_and_report
+
+external_components:
+  - source: github://luar123/zigbee_esphome
+    components: [zigbee]
+
+esp32:
+  board: seeed_xiao_esp32c6
+  variant: esp32c6
+  partitions: partitions_zb.csv
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+globals:
+  - id: dry_value
+    type: float
+    restore_value: yes
+    initial_value: '0'
+  - id: wet_value
+    type: float
+    restore_value: yes
+    initial_value: '0'
+  - id: is_calibrated
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: has_joined
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+output:
+  - platform: gpio
+    pin: GPIO3
+    id: rf_switch_en
+  - platform: gpio
+    pin: GPIO14
+    id: rf_ant_select
+  - platform: ledc
+    pin: GPIO21
+    id: pwm_output
+    frequency: 200kHz
+  - platform: gpio
+    pin: GPIO18
+    id: yellow_led
+  - platform: gpio
+    pin: GPIO19
+    id: green_led
+  - platform: gpio
+    pin: GPIO20
+    id: red_led
+
+light:
+  - platform: monochromatic
+    output: pwm_output
+    id: pwm_excitation
+    internal: true
+    default_transition_length: 0s
+
+sensor:
+  - platform: adc
+    id: soil_sensor
+    pin: GPIO1
+    update_interval: never
+    internal: true
+    attenuation: 12db
+  - platform: adc
+    id: battery_sensor
+    pin: GPIO0
+    update_interval: never
+    internal: true
+    attenuation: 12db
+  - platform: internal_temperature
+    id: internal_temp
+    update_interval: never
+    internal: true
+
+zigbee:
+  id: zb
+  name: "XIAO Soil Moisture"
+  manufacturer: "Seeed Studio"
+  power_supply: 0x03
+  endpoints:
+    - num: 1
+      device_type: TEMPERATURE_SENSOR
+      clusters:
+        - id: REL_HUMIDITY_MEASUREMENT
+          attributes:
+            - attribute_id: 0
+              id: moisture_attr
+              type: U16
+              report: true
+              value: 0xFFFF
+        - id: TEMP_MEASUREMENT
+          attributes:
+            - attribute_id: 0
+              type: S16
+              report: true
+              value: 0
+              device: internal_temp
+              scale: 100
+        - id: POWER_CONFIG
+          attributes:
+            - attribute_id: 0x0021
+              id: battery_attr
+              type: U8
+              report: true
+              value: 0
+  on_join:
+    then:
+      - lambda: 'id(has_joined) = true;'
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO2
+      mode: INPUT_PULLUP
+      allow_other_uses: true
+    id: button
+    on_press:
+      then:
+        - lambda: |-
+            static int press_count = 0;
+            static uint32_t last_press = 0;
+            uint32_t now = millis();
+            if (now - last_press > 5000) press_count = 0;
+            press_count++;
+            last_press = now;
+            ESP_LOGI("btn", "Press %d/10", press_count);
+            // Acknowledge press — flash yellow briefly
+            id(yellow_led).turn_on();
+            delay(50);
+            id(yellow_led).turn_off();
+            if (press_count >= 10) {
+              press_count = 0;
+              id(do_calibration).execute();
+            }
+    on_click:
+      min_length: 5s
+      max_length: 20s
+      then:
+        - zigbee.reset: zb
+
+deep_sleep:
+  id: deep_sleep_control
+  run_duration: 15s
+  sleep_duration: 480min
+  wakeup_pin:
+    number: GPIO2
+    inverted: true
+    allow_other_uses: true
+    mode: INPUT_PULLUP
+
+script:
+  - id: read_and_report
+    then:
+      # Start excitation, read sensors, stop excitation
+      - light.turn_on:
+          id: pwm_excitation
+          brightness: 68%
+      - delay: 500ms
+      - component.update: soil_sensor
+      - delay: 200ms
+      - component.update: soil_sensor
+      - delay: 200ms
+      - component.update: soil_sensor
+      - delay: 200ms
+      - component.update: battery_sensor
+      - component.update: internal_temp
+      - light.turn_off: pwm_excitation
+      # Calculate and set Zigbee attributes
+      - lambda: |-
+          // Battery (always report)
+          float batt = id(battery_sensor).state;
+          float batt_full = ${battery_full};
+          float batt_empty = ${battery_empty};
+          int batt_pct = 0;
+          if (batt >= batt_full) batt_pct = 200;
+          else if (batt > batt_empty) batt_pct = (int)(((batt - batt_empty) / (batt_full - batt_empty)) * 200.0);
+          id(battery_attr).set_attr(batt_pct);
+
+          if (!id(is_calibrated)) {
+            id(moisture_attr).set_attr(0xFFFF);
+            id(error_blink).execute();
+            return;
+          }
+
+          float moisture = id(soil_sensor).state;
+          float diff = id(dry_value) - id(wet_value);
+          float moisture_pct = 0.0;
+          if (diff > 0.01) {
+            moisture_pct = (id(dry_value) - moisture) / diff * 100.0;
+            if (moisture_pct < 0) moisture_pct = 0;
+            if (moisture_pct > 100) moisture_pct = 100;
+          }
+          id(moisture_attr).set_attr((int)(moisture_pct * 100));
+
+          // LED flash + adaptive sleep
+          float ref_dry = id(dry_value) - diff * 0.23;
+          float ref_wet = id(dry_value) - diff * 0.58;
+          if (moisture >= ref_dry) {
+            id(red_led).turn_on();
+            id(deep_sleep_control).set_sleep_duration(900000);
+          } else if (moisture > ref_wet) {
+            id(yellow_led).turn_on();
+            id(deep_sleep_control).set_sleep_duration(3600000);
+          } else {
+            id(green_led).turn_on();
+            id(deep_sleep_control).set_sleep_duration(28800000);
+          }
+      - delay: 1s
+      - output.turn_off: red_led
+      - output.turn_off: yellow_led
+      - output.turn_off: green_led
+      - if:
+          condition:
+            lambda: 'return id(has_joined);'
+          then:
+            - zigbee.report: zb
+            - delay: 2s
+
+  - id: error_blink
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return true;'
+          then:
+            - output.turn_on: red_led
+            - delay: 200ms
+            - output.turn_off: red_led
+            - delay: 200ms
+
+  - id: cal_blink_green
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return true;'
+          then:
+            - output.turn_on: green_led
+            - delay: 500ms
+            - output.turn_off: green_led
+            - delay: 500ms
+
+  - id: do_calibration
+    then:
+      - script.stop: error_blink
+      - output.turn_off: red_led
+      - deep_sleep.prevent: deep_sleep_control
+      - light.turn_on:
+          id: pwm_excitation
+          brightness: 68%
+      - delay: 500ms
+      # Phase 1: Dry reading (immediate, sensor is already in air)
+      - component.update: soil_sensor
+      - delay: 200ms
+      - component.update: soil_sensor
+      - delay: 200ms
+      - component.update: soil_sensor
+      - delay: 200ms
+      - lambda: |-
+          id(dry_value) = id(soil_sensor).state;
+          ESP_LOGI("cal", "Dry: %.3f V", id(dry_value));
+      - output.turn_on: yellow_led
+      - delay: 1s
+      - output.turn_off: yellow_led
+      # Phase 2: Blink green until sensor detects water (cooperative)
+      - script.execute: cal_blink_green
+      - wait_until:
+          lambda: |-
+            static int confirm = 0;
+            static uint32_t last_check = 0;
+            uint32_t now = millis();
+            if (now - last_check < 300) return false;
+            last_check = now;
+            id(soil_sensor).update();
+            float v = id(soil_sensor).state;
+            if (v < id(dry_value) * 0.7) { confirm++; } else { confirm = 0; }
+            if (confirm >= 3) { confirm = 0; return true; }
+            return false;
+      - script.stop: cal_blink_green
+      - lambda: 'ESP_LOGI("cal", "Water detected!");'
+      # Settle and take wet reading
+      - output.turn_on: green_led
+      - delay: 3s
+      - component.update: soil_sensor
+      - delay: 200ms
+      - component.update: soil_sensor
+      - delay: 200ms
+      - component.update: soil_sensor
+      - delay: 200ms
+      - lambda: |-
+          id(wet_value) = id(soil_sensor).state;
+          ESP_LOGI("cal", "Wet: %.3f V", id(wet_value));
+      - output.turn_off: green_led
+      # Validate calibration
+      - lambda: |-
+          float diff = id(dry_value) - id(wet_value);
+          if (diff > 0.1) {
+            id(is_calibrated) = true;
+            ESP_LOGI("cal", "Calibration OK (dry=%.2f wet=%.2f diff=%.2f)", id(dry_value), id(wet_value), diff);
+            // Success: green LED solid 2s
+            id(green_led).turn_on();
+          } else {
+            id(is_calibrated) = false;
+            ESP_LOGW("cal", "Failed: readings too similar (dry=%.2f wet=%.2f diff=%.2f)", id(dry_value), id(wet_value), diff);
+            // Failure: red LED solid 2s
+            id(red_led).turn_on();
+          }
+      - delay: 2s
+      - output.turn_off: red_led
+      - output.turn_off: green_led
+      - light.turn_off: pwm_excitation
+      - if:
+          condition:
+            lambda: 'return id(is_calibrated);'
+          then:
+            - deep_sleep.allow: deep_sleep_control
+            - script.execute: read_and_report
+          else:
+            - script.execute: error_blink
