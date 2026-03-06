@@ -2,6 +2,10 @@
 
 ESPHome Zigbee firmware for the [Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor](https://www.seeedstudio.com/XIAO-ESP32C6-p-5884.html).
 
+## Status
+
+At time of writing, this is operating in a garden outside. I don't know how much more power-efficent it is yet.
+
 ## Features
 
 - Zigbee soil moisture, temperature, and battery reporting
